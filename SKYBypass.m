@@ -84,8 +84,7 @@ static void STATUS(NSString *fmt, ...)
         gLabel.userInteractionEnabled = NO;
         [w addSubview:gLabel];
     }
-    gLabel.text = [gLines componentsJoinedByString:@"
-"];
+    gLabel.text = [gLines componentsJoinedByString:@"\n"];
 }
 
 static uintptr_t base(void)
