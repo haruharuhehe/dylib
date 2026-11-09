@@ -1,35 +1,35 @@
-// SKYBypass.m — SKYCheat.framework runtime bypass + on-screen debug readout
+// SKYBypass.m — SKYCheat.framework runtime bypass (v2)
+//   · v1 worked: the menu appeared.  v2 fixes the two problems v1 had:
+//       - the menu could never be closed  -> we stopped poking menu_open every tick
+//       - the app crashed                 -> show()/hide() are now called at most twice,
+//                                            never again once the overlay is attached
+//   · adds its own 3-finger double-tap toggle (same gesture as the cheat) so the menu
+//     can be closed without depending on the SDK's own recogniser.
+//
 // arm64 / iOS 14+ · clang -dynamiclib -fobjc-arc -framework Foundation -framework UIKit
-//
-// Why this instead of patching the framework binary:
-//   every static attempt died inside the SDK's own show path and we had no way to
-//   see *where*.  This dylib drives the SDK's public entry -[ImGuiLoad show] from
-//   the main thread on a timer, catches exceptions, and prints each step on screen
-//   so the failure is readable without a Mac, Frida or Console.
-//
-// Offsets are absolute vmaddrs of SKYCheat.framework/SKYCheat (__TEXT vmaddr == 0).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <objc/message.h>
 #import <stdarg.h>
 #import <stdint.h>
 #import <string.h>
 
-@interface NSObject (SKYBypassShow)
-- (void)show;
-@end
-
 #define OFF_MENU_OPEN    0x3abc066ULL   // uint8: ImGui p_open of the main window
 #define OFF_AUTH_FLAG    0x3aaba60ULL   // uint8: draw gate read by drawInMTKView
+#define MAX_SHOWS        2
+#define TICK_SECONDS     1.0
+#define WATCHDOG_SECONDS 15.0
 
 static uintptr_t gBase;
-static UILabel  *gLabel;
 static NSString *gLog;
 static id        gImGuiLoad;
 static BOOL      gSwizzled;
+static BOOL      gAttached;
+static BOOL      gWatchdogRunning;
+static int       gShows;
+static int       gTicks;
 
 static NSString *logPath(void)
 {
@@ -49,38 +49,12 @@ static void LOG(NSString *fmt, ...)
     va_end(ap);
     NSLog(@"[SKYBypass] %@", s);
     NSString *line = [NSString stringWithFormat:@"%@\n", s];
+    if (![NSFileManager.defaultManager fileExistsAtPath:logPath()])
+        [NSFileManager.defaultManager createFileAtPath:logPath() contents:nil attributes:nil];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
-    if (!fh) [[NSFileManager defaultManager] createFileAtPath:logPath() contents:nil attributes:nil];
-    fh = [NSFileHandle fileHandleForWritingAtPath:logPath()];
     [fh seekToEndOfFile];
     [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
-}
-
-// on-screen readout: last 4 lines, so a crash point is readable in a screenshot
-static NSMutableArray<NSString *> *gLines;
-static void STATUS(NSString *fmt, ...)
-{
-    va_list ap; va_start(ap, fmt);
-    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    LOG(@"%@", s);
-    if (!gLines) gLines = [NSMutableArray array];
-    [gLines addObject:s];
-    while (gLines.count > 4) [gLines removeObjectAtIndex:0];
-
-    if (!gLabel) {
-        UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
-        if (!w) return;
-        gLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, w.bounds.size.width - 16, 90)];
-        gLabel.numberOfLines = 4;
-        gLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
-        gLabel.textColor = UIColor.yellowColor;
-        gLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
-        gLabel.userInteractionEnabled = NO;
-        [w addSubview:gLabel];
-    }
-    gLabel.text = [gLines componentsJoinedByString:@"\n"];
 }
 
 static uintptr_t base(void)
@@ -96,13 +70,9 @@ static uintptr_t base(void)
     return 0;
 }
 
-static void poke(uintptr_t off, uint8_t v)
-{
-    volatile uint8_t *p = (volatile uint8_t *)(base() + off);
-    if (*p != v) *p = v;
-}
+static uint8_t peek(uintptr_t off) { return *(volatile uint8_t *)(base() + off); }
 
-// ------------------------------------------------------------- ASStatusView
+// ------------------------------------------------------------ licence UI
 
 static void swz_none(id s, SEL c) { }
 static void swz2(id s, SEL c, id a, id b) { }
@@ -136,10 +106,108 @@ static void hideLicenseUI(void)
     for (UIWindow *w in UIApplication.sharedApplication.windows)
         for (UIView *v in w.subviews)
             if ([v isKindOfClass:cls]) v.hidden = YES;
-    STATUS(@"license UI swizzled");
+    LOG(@"license UI swizzled");
 }
 
-// ------------------------------------------------------------- overlay
+// ------------------------------------------------------------ overlay
+
+static UIView *hostView(void)
+{
+    UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
+    return w.rootViewController.view;
+}
+
+static BOOL overlayAttached(void)
+{
+    Class mtk = NSClassFromString(@"MTKView");
+    UIView *host = hostView();
+    if (!mtk || !host) return NO;
+    for (UIView *v in host.subviews)
+        if ([v isKindOfClass:mtk]) return YES;
+    return NO;
+}
+
+static id imguiload(void)
+{
+    if (gImGuiLoad) return gImGuiLoad;
+    Class il = NSClassFromString(@"ImGuiLoad");
+    if (!il) return nil;
+    gImGuiLoad = [[il alloc] init];
+    LOG(@"ImGuiLoad instance %@", gImGuiLoad ? @"created" : @"nil");
+    return gImGuiLoad;
+}
+
+static void skyShowMenu(void)
+{
+    id il = imguiload();
+    if (!il || gShows >= MAX_SHOWS) return;
+    gShows++;
+    @try {
+        [(NSObject *)il performSelector:NSSelectorFromString(@"show")];
+        LOG(@"show() #%d", gShows);
+    } @catch (NSException *e) {
+        LOG(@"show EXC %@", e.reason);
+    }
+}
+
+static void skyHideMenu(void)
+{
+    id il = imguiload();
+    if (!il) return;
+    @try {
+        [(NSObject *)il performSelector:NSSelectorFromString(@"hide")];
+        LOG(@"hide()");
+    } @catch (NSException *e) {
+        LOG(@"hide EXC %@", e.reason);
+    }
+}
+
+// ------------------------------------------------------------ toggle gesture
+
+@interface SkyTap : NSObject
+- (void)onTap;
+@end
+
+@implementation SkyTap
+- (void)onTap
+{
+    if (!base()) return;
+    if (peek(OFF_MENU_OPEN)) {
+        LOG(@"gesture -> close");
+        skyHideMenu();
+    } else {
+        LOG(@"gesture -> open");
+        skyShowMenu();
+    }
+    gAttached = overlayAttached();
+}
+@end
+
+static SkyTap *gTap;
+static UITapGestureRecognizer *gToggle;
+
+static void installToggle(void)
+{
+    UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
+    if (!w) return;
+    if (gToggle) {
+        for (UIGestureRecognizer *g in w.gestureRecognizers)
+            if (g == gToggle) return;
+    }
+    if (!gTap) gTap = [SkyTap new];
+    UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:gTap
+                                                                      action:@selector(onTap)];
+    t.numberOfTapsRequired = 2;
+    t.numberOfTouchesRequired = 3;
+    t.cancelsTouchesInView = NO;
+    t.delaysTouchesBegan = NO;
+    t.delaysTouchesEnded = NO;
+    [w addGestureRecognizer:t];
+    gToggle = t;
+    LOG(@"toggle gesture installed on %@", NSStringFromClass([w class]));
+}
+
+// ------------------------------------------------------------ loop
 
 static void tick(void);
 static void later(NSTimeInterval s)
@@ -148,9 +216,6 @@ static void later(NSTimeInterval s)
                    dispatch_get_main_queue(), ^{ tick(); });
 }
 
-static int gTicks;
-static int gShownFails;
-
 static void tick(void)
 {
     @try {
@@ -158,61 +223,48 @@ static void tick(void)
         gTicks++;
 
         hideLicenseUI();
-        poke(OFF_AUTH_FLAG, 1);
 
-        NSArray *wins = UIApplication.sharedApplication.windows;
-        if (wins.count == 0) { later(1.0); return; }
+        if (!UIApplication.sharedApplication.windows.count) { later(TICK_SECONDS); return; }
+        if (!hostView()) { later(TICK_SECONDS); return; }
 
-        UIView *host = [[wins.firstObject rootViewController] view];
-        if (!host) { STATUS(@"t%d: no rootVC view", gTicks); later(1.0); return; }
+        installToggle();
 
-        Class il = NSClassFromString(@"ImGuiLoad");
-        if (!il) { STATUS(@"no ImGuiLoad class"); later(2.0); return; }
+        gAttached = overlayAttached();
 
-        if (!gImGuiLoad) {
-            gImGuiLoad = [[il alloc] init];
-            STATUS(@"t%d: ImGuiLoad %s", gTicks, gImGuiLoad ? "ok" : "nil");
-        }
-        if (!gImGuiLoad) { later(2.0); return; }
-
-        Class mtk = NSClassFromString(@"MTKView");
-        BOOL attached = NO;
-        for (UIView *v in host.subviews)
-            if (mtk && [v isKindOfClass:mtk]) attached = YES;
-
-        if (!attached && gShownFails < 3) {
-            @try {
-                [(NSObject *)gImGuiLoad performSelector:NSSelectorFromString(@"show")];
-                STATUS(@"t%d: show() ok, host=%@", gTicks, NSStringFromClass([host class]));
-            } @catch (NSException *e) {
-                gShownFails++;
-                STATUS(@"t%d: show EXC %@", gTicks, e.reason);
+        if (!gAttached) {
+            if (gShows < MAX_SHOWS) skyShowMenu();
+            gAttached = overlayAttached();
+            if (gAttached) {
+                LOG(@"overlay ATTACHED after %d tick(s)", gTicks);
+                // from now on we never poke menu_open again: the gesture must be able
+                // to close the menu, and the SDK owns that byte.
+                *(volatile uint8_t *)(base() + OFF_AUTH_FLAG) = 1;
             }
-            for (UIView *v in host.subviews)
-                if (mtk && [v isKindOfClass:mtk]) attached = YES;
-            STATUS(@"t%d: MTKView %@", gTicks, attached ? @"ATTACHED" : @"missing");
-        } else if (attached && gTicks % 15 == 1) {
-            STATUS(@"t%d: overlay alive (mtkView in window)", gTicks);
         }
 
-        if (attached && gLabel && !gLabel.superview) [host addSubview:gLabel];
+        if (gAttached && !gWatchdogRunning) {
+            gWatchdogRunning = YES;
+            LOG(@"entering watchdog, no more show()/hide() unless the view disappears");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(WATCHDOG_SECONDS * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!overlayAttached()) {
+                    LOG(@"watchdog: overlay gone, one more show()");
+                    gAttached = NO;
+                    skyShowMenu();
+                }
+            });
+        }
 
-        poke(OFF_MENU_OPEN, 1);
-
-        if (gTicks < 600) later(2.0);
+        if (!gAttached && gTicks < 120) later(TICK_SECONDS);
     } @catch (NSException *e) {
-        STATUS(@"tick EXC %@", e.reason);
-        later(2.0);
+        LOG(@"tick EXC %@", e.reason);
+        later(TICK_SECONDS);
     }
 }
 
 __attribute__((constructor))
 static void skyInit(void)
 {
-    LOG(@"---- SKYBypass loaded ----");
-    NSSetUncaughtExceptionHandler(NULL);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        STATUS(@"SKYBypass loaded, waiting for SKYCheat");
-        later(2.0);
-    });
+    LOG(@"---- SKYBypass v2 loaded ----");
+    dispatch_async(dispatch_get_main_queue(), ^{ later(0.5); });
 }
