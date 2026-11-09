@@ -9,13 +9,16 @@
 // arm64 / iOS 14+ · clang -dynamiclib -fobjc-arc -framework Foundation -framework UIKit
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h> 
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <execinfo.h>
 #import <signal.h>
 #import <dlfcn.h>
 #import <fcntl.h>
+#import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
+#import <sys/ucontext.h>
 #import <unistd.h>
 #import <stdarg.h>
 #import <stdio.h>
@@ -47,6 +50,7 @@ static BOOL      gAttached;
 static BOOL      gWatchdogRunning;
 static int       gShows;
 static int       gTicks;
+static int       gPatched;
 
 static NSString *logPath(void)
 {
@@ -87,13 +91,39 @@ static NSString *crashPath(void)
     return [docs stringByAppendingPathComponent:@"skycrash.log"];
 }
 
-static void skySignal(int sig)
+static void skySignal(int sig, siginfo_t *si, void *uctx)
 {
+    ucontext_t *uc = (ucontext_t *)uctx;
+    uintptr_t pc = 0, lr = 0, fpx = 0, r0 = 0, r1 = 0;
+    if (uc && uc->uc_mcontext) {
+        pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
+        lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+        fpx = (uintptr_t)uc->uc_mcontext->__ss.__fp;
+        r0 = (uintptr_t)uc->uc_mcontext->__ss.__x[0];
+        r1 = (uintptr_t)uc->uc_mcontext->__ss.__x[1];
+    }
     void *frames[48];
     int n = backtrace(frames, 48);
     char buf[8192];
     int len = 0;
     len += snprintf(buf + len, sizeof(buf) - len, "signal %d (%s)\n", sig, strsignal(sig));
+    len += snprintf(buf + len, sizeof(buf) - len,"fault=%p pc=0x%lx lr=0x%lx fp=0x%lx x0=0x%lx x1=0x%lx\n",(void *)(si ? si->si_addr : 0), (unsigned long)pc, (unsigned long)lr,(unsigned long)fpx, (unsigned long)r0, (unsigned long)r1);
+    {
+        Dl_info pi; const char *img = "?";
+        unsigned long off = 0;
+        if (pc && dladdr((void *)pc, &pi) && pi.dli_fbase) {
+            off = (unsigned long)(pc - (uintptr_t)pi.dli_fbase);
+            if (pi.dli_fname) { const char *sl = strrchr(pi.dli_fname, '/'); img = sl ? sl + 1 : pi.dli_fname; }
+        }
+        len += snprintf(buf + len, sizeof(buf) - len, "pcimg=%s+0x%lx", img, off);
+        img = "?"; off = 0;
+        if (lr && dladdr((void *)lr, &pi) && pi.dli_fbase) {
+            off = (unsigned long)(lr - (uintptr_t)pi.dli_fbase);
+            if (pi.dli_fname) { const char *sl = strrchr(pi.dli_fname, '/'); img = sl ? sl + 1 : pi.dli_fname; }
+        }
+        len += snprintf(buf + len, sizeof(buf) - len, " lrimg=%s+0x%lx (slide inside SKYCheat base 0x%lx)\n",
+                        img, off, (unsigned long)base());
+    }
     for (int i = 0; i < n && len < (int)sizeof(buf) - 200; i++) {
         Dl_info info;
         uintptr_t off = 0;
@@ -116,15 +146,33 @@ static void skySignal(int sig)
 
 static void armCrashHandlers(void)
 {
-    for (int s = 1; s < 32; s++) {
-        switch (s) {
-            case SIGSEGV: case SIGBUS: case SIGABRT: case SIGILL: case SIGFPE: case SIGTRAP:
-                signal(s, skySignal);
-                break;
-            default: break;
-        }
-    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = skySignal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE, SIGTRAP };
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) sigaction(sigs[i], &sa, NULL);
 }
+
+// runtime code patch inside SKYCheat (COW page + icache flush)
+static int patchCode(uintptr_t addr, uint32_t word)
+{
+    vm_address_t page = (vm_address_t)(addr & ~(uintptr_t)0x3fff);
+    if (vm_protect(mach_task_self(), page, 0x4000, false,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0;
+    *(volatile uint32_t *)addr = word;
+    sys_icache_invalidate((void *)addr, 4);
+    vm_protect(mach_task_self(), page, 0x4000, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    return 1;
+}
+
+// 0x2f293a8: the per-frame routine invoked by drawInMTKView does an indirect call to a
+// global callback with a NULL context -> SIGSEGV (that is exactly what the crash log
+// shows). Replace `blr x8` with `mov w0, #0` so the callback is skipped and the code
+// takes its "no callback" branch instead.
+#define OFF_FRAME_CB   0x2f293a8ULL
+#define PATCH_FRAME_CB 1
 
 static void publishCrashReport(void)
 {
@@ -292,6 +340,14 @@ static void tick(void)
 
         hideLicenseUI();
 
+#if PATCH_FRAME_CB
+        if (!gPatched) {
+            gPatched = 1;
+            int ok = patchCode(base() + OFF_FRAME_CB, 0x52800000u);
+            STATUS(@"patch frame-cb %@", ok ? @"ok" : @"FAILED");
+        }
+#endif
+
         if (!UIApplication.sharedApplication.windows.count) { later(TICK_SECONDS); return; }
         if (!hostView()) { later(TICK_SECONDS); return; }
 
@@ -342,6 +398,6 @@ static void skyInit(void)
 {
     armCrashHandlers();
     publishCrashReport();
-    STATUS(@"SKYBypass v5 diag=%d", DIAG_NO_DRAW);
+    STATUS(@"SKYBypass v6 diag=%d patched=%d", DIAG_NO_DRAW, PATCH_FRAME_CB);
     dispatch_async(dispatch_get_main_queue(), ^{ later(2.0); });
 }
