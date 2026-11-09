@@ -11,8 +11,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <mach-o/dyld.h> 
+#import <mach-o/dyld.h>
+#import <execinfo.h>
+#import <signal.h>
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import <stdarg.h>
+#import <stdio.h>
 #import <stdint.h>
 #import <string.h>
 
@@ -29,7 +35,7 @@
 //   1 = keep the overlay attached but force menu_open back to 0, so ImGui never
 //       draws the menu, and nothing inside it can run.  stays alive => the crash is
 //       in the menu/draw side;  still crashes => the crash is in attaching the view.
-#define DIAG_NO_DRAW     1
+#define DIAG_NO_DRAW     0
 #define TICK_SECONDS     2.0
 #define WATCHDOG_SECONDS 20.0
 
@@ -66,6 +72,69 @@ static void LOG(NSString *fmt, ...)
     [fh seekToEndOfFile];
     [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
+}
+
+// ------------------------------------------------- crash capture
+// A crash dies before we can read anything, so: on SIGSEGV/SIGABRT/etc we dump the
+// backtrace to Documents/skycrash.log, and on the NEXT launch that file is copied to
+// the pasteboard -- paste it in chat and the crashing frame is readable offline.
+
+static NSString *crashPath(void)
+{
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:docs
+                             withIntermediateDirectories:YES attributes:nil error:NULL];
+    return [docs stringByAppendingPathComponent:@"skycrash.log"];
+}
+
+static void skySignal(int sig)
+{
+    void *frames[48];
+    int n = backtrace(frames, 48);
+    char buf[8192];
+    int len = 0;
+    len += snprintf(buf + len, sizeof(buf) - len, "signal %d (%s)\n", sig, strsignal(sig));
+    for (int i = 0; i < n && len < (int)sizeof(buf) - 200; i++) {
+        Dl_info info;
+        uintptr_t off = 0;
+        const char *img = "?";
+        if (dladdr(frames[i], &info) && info.dli_fbase) {
+            off = (uintptr_t)frames[i] - (uintptr_t)info.dli_fbase;
+            if (info.dli_fname) {
+                const char *slash = strrchr(info.dli_fname, '/');
+                img = slash ? slash + 1 : info.dli_fname;
+            }
+        }
+        len += snprintf(buf + len, sizeof(buf) - len, "#%02d %s+0x%lx %s\n",
+                        i, img, (unsigned long)off, (info.dli_sname ? info.dli_sname : ""));
+    }
+    int fd = open([crashPath() fileSystemRepresentation], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { write(fd, buf, len); close(fd); }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void armCrashHandlers(void)
+{
+    for (int s = 1; s < 32; s++) {
+        switch (s) {
+            case SIGSEGV: case SIGBUS: case SIGABRT: case SIGILL: case SIGFPE: case SIGTRAP:
+                signal(s, skySignal);
+                break;
+            default: break;
+        }
+    }
+}
+
+static void publishCrashReport(void)
+{
+    if (![[NSFileManager defaultManager] fileExistsAtPath:crashPath()]) return;
+    NSString *txt = [NSString stringWithContentsOfFile:crashPath() encoding:NSUTF8StringEncoding error:NULL];
+    if (txt.length) {
+        [UIPasteboard generalPasteboard].string = txt;
+        LOG(@"crash report from last run copied to pasteboard");
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:crashPath() error:NULL];
 }
 
 // ------------------------------------------------- on-screen status (debug)
@@ -271,6 +340,8 @@ static void tick(void)
 __attribute__((constructor))
 static void skyInit(void)
 {
-    STATUS(@"SKYBypass v4 diag no-draw=%d", DIAG_NO_DRAW);
+    armCrashHandlers();
+    publishCrashReport();
+    STATUS(@"SKYBypass v5 diag=%d", DIAG_NO_DRAW);
     dispatch_async(dispatch_get_main_queue(), ^{ later(2.0); });
 }
