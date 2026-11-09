@@ -236,9 +236,13 @@ static uint8_t peek(uintptr_t off) { return *(volatile uint8_t *)(base() + off);
 
 // ------------------------------------------------------------ licence UI
 
+// NOTE: parameters are declared as plain integers, not objects, on purpose.
+// With `id` params the compiler under ARC emitted objc_storeStrong on garbage argv
+// slots and that itself crashed (see skycrash.log: swz8 -> objc_storeStrong -> SIGSEGV).
 static void swz_none(id s, SEL c) { }
-static void swz2(id s, SEL c, id a, id b) { }
-static void swz8(id s, SEL c, id a, id b, id d, id e, id f, id g) { }
+static void swz2(id s, SEL c, uintptr_t a, uintptr_t b) { }
+static void swz8(id s, SEL c, uintptr_t a, uintptr_t b, uintptr_t d,
+                 uintptr_t e, uintptr_t f, uintptr_t g) { }
 
 static void killSel(Class cls, const char *name, IMP imp)
 {
@@ -399,6 +403,6 @@ static void skyInit(void)
 {
     armCrashHandlers();
     publishCrashReport();
-    STATUS(@"SKYBypass v6 diag=%d patched=%d", DIAG_NO_DRAW, PATCH_FRAME_CB);
+    STATUS(@"SKYBypass v7 diag=%d patched=%d", DIAG_NO_DRAW, PATCH_FRAME_CB);
     dispatch_async(dispatch_get_main_queue(), ^{ later(2.0); });
 }
