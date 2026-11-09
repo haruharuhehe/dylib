@@ -19,8 +19,8 @@
 #define OFF_MENU_OPEN    0x3abc066ULL   // uint8: ImGui p_open of the main window
 #define OFF_AUTH_FLAG    0x3aaba60ULL   // uint8: draw gate read by drawInMTKView
 #define MAX_SHOWS        2
-#define TICK_SECONDS     1.0
-#define WATCHDOG_SECONDS 15.0
+#define TICK_SECONDS     2.0
+#define WATCHDOG_SECONDS 20.0
 
 static uintptr_t gBase;
 static NSString *gLog;
@@ -55,6 +55,37 @@ static void LOG(NSString *fmt, ...)
     [fh seekToEndOfFile];
     [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
     [fh closeFile];
+}
+
+// ------------------------------------------------- on-screen status (debug)
+
+static UILabel *gLabel;
+static NSMutableArray<NSString *> *gLines;
+
+static void STATUS(NSString *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    NSString *s2 = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    LOG(@"%@", s2);
+
+    if (!gLines) gLines = [NSMutableArray array];
+    [gLines addObject:s2];
+    while (gLines.count > 4) [gLines removeObjectAtIndex:0];
+
+    if (!gLabel) {
+        UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
+        if (!w) return;
+        gLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 60, w.bounds.size.width - 16, 84)];
+        gLabel.numberOfLines = 4;
+        gLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+        gLabel.textColor = UIColor.yellowColor;
+        gLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.65];
+        gLabel.userInteractionEnabled = NO;
+        [w addSubview:gLabel];
+    }
+    gLabel.text = [gLines componentsJoinedByString:@"
+"];
 }
 
 static uintptr_t base(void)
@@ -144,9 +175,9 @@ static void skyShowMenu(void)
     gShows++;
     @try {
         [(NSObject *)il performSelector:NSSelectorFromString(@"show")];
-        LOG(@"show() #%d", gShows);
+        STATUS(@"show #%d", gShows);
     } @catch (NSException *e) {
-        LOG(@"show EXC %@", e.reason);
+        STATUS(@"show EXC %@", e.reason);
     }
 }
 
@@ -160,51 +191,6 @@ static void skyHideMenu(void)
     } @catch (NSException *e) {
         LOG(@"hide EXC %@", e.reason);
     }
-}
-
-// ------------------------------------------------------------ toggle gesture
-
-@interface SkyTap : NSObject
-- (void)onTap;
-@end
-
-@implementation SkyTap
-- (void)onTap
-{
-    if (!base()) return;
-    if (peek(OFF_MENU_OPEN)) {
-        LOG(@"gesture -> close");
-        skyHideMenu();
-    } else {
-        LOG(@"gesture -> open");
-        skyShowMenu();
-    }
-    gAttached = overlayAttached();
-}
-@end
-
-static SkyTap *gTap;
-static UITapGestureRecognizer *gToggle;
-
-static void installToggle(void)
-{
-    UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
-    if (!w) return;
-    if (gToggle) {
-        for (UIGestureRecognizer *g in w.gestureRecognizers)
-            if (g == gToggle) return;
-    }
-    if (!gTap) gTap = [SkyTap new];
-    UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:gTap
-                                                                      action:@selector(onTap)];
-    t.numberOfTapsRequired = 2;
-    t.numberOfTouchesRequired = 3;
-    t.cancelsTouchesInView = NO;
-    t.delaysTouchesBegan = NO;
-    t.delaysTouchesEnded = NO;
-    [w addGestureRecognizer:t];
-    gToggle = t;
-    LOG(@"toggle gesture installed on %@", NSStringFromClass([w class]));
 }
 
 // ------------------------------------------------------------ loop
@@ -227,15 +213,15 @@ static void tick(void)
         if (!UIApplication.sharedApplication.windows.count) { later(TICK_SECONDS); return; }
         if (!hostView()) { later(TICK_SECONDS); return; }
 
-        installToggle();
-
         gAttached = overlayAttached();
 
         if (!gAttached) {
             if (gShows < MAX_SHOWS) skyShowMenu();
             gAttached = overlayAttached();
             if (gAttached) {
-                LOG(@"overlay ATTACHED after %d tick(s)", gTicks);
+                STATUS(@"ATTACHED t%d", gTicks);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [gLabel removeFromSuperview]; });
                 // from now on we never poke menu_open again: the gesture must be able
                 // to close the menu, and the SDK owns that byte.
                 *(volatile uint8_t *)(base() + OFF_AUTH_FLAG) = 1;
@@ -244,11 +230,11 @@ static void tick(void)
 
         if (gAttached && !gWatchdogRunning) {
             gWatchdogRunning = YES;
-            LOG(@"entering watchdog, no more show()/hide() unless the view disappears");
+            STATUS(@"watchdog armed");
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(WATCHDOG_SECONDS * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (!overlayAttached()) {
-                    LOG(@"watchdog: overlay gone, one more show()");
+                    STATUS(@"watchdog: overlay gone, re-show");
                     gAttached = NO;
                     skyShowMenu();
                 }
@@ -265,6 +251,6 @@ static void tick(void)
 __attribute__((constructor))
 static void skyInit(void)
 {
-    LOG(@"---- SKYBypass v2 loaded ----");
-    dispatch_async(dispatch_get_main_queue(), ^{ later(0.5); });
+    STATUS(@"SKYBypass v3 loaded");
+    dispatch_async(dispatch_get_main_queue(), ^{ later(2.0); });
 }
