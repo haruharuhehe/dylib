@@ -1,0 +1,28 @@
+ ```
+   name: build-skybypass
+
+   on:
+     push:
+     workflow_dispatch:
+
+   jobs:
+     build:
+       runs-on: macos-latest
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: build dylib
+           run: |
+             SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+             clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2
+ -Wno-deprecated-declarations -framework Foundation -framework UIKit -install_name
+ @executable_path/Frameworks/SKYBypass.dylib -o SKYBypass.dylib SKYBypass.m
+             brew install ldid
+             ldid -S SKYBypass.dylib
+             ls -l SKYBypass.dylib
+
+         - uses: actions/upload-artifact@v4
+           with:
+             name: SKYBypass-dylib
+             path: SKYBypass.dylib
+ ```
