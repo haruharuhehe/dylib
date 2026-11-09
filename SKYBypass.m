@@ -43,6 +43,7 @@
 #define WATCHDOG_SECONDS 20.0
 
 static uintptr_t gBase;
+static uintptr_t base(void);
 static NSString *gLog;
 static id        gImGuiLoad;
 static BOOL      gSwizzled;
