@@ -188,7 +188,7 @@ static void skyHideMenu(void)
         [(NSObject *)il performSelector:NSSelectorFromString(@"hide")];
         LOG(@"hide()");
     } @catch (NSException *e) {
-        LOG(@"hide EXC %@", e.reason);
+        LOG(@"hide EXC %@", e.reason); 
     }
 }
 
