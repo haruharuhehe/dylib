@@ -19,6 +19,17 @@
 #define OFF_MENU_OPEN    0x3abc066ULL   // uint8: ImGui p_open of the main window
 #define OFF_AUTH_FLAG    0x3aaba60ULL   // uint8: draw gate read by drawInMTKView
 #define MAX_SHOWS        2
+
+// the yellow text in the corner is my debug readout, not the cheat's UI.
+//   1 = show it for a few seconds while starting  ·  0 = never show it
+#define SHOW_DEBUG_LABEL 1
+#define LABEL_LIFETIME   5.0
+
+// v4 diagnostic switch:
+//   1 = keep the overlay attached but force menu_open back to 0, so ImGui never
+//       draws the menu, and nothing inside it can run.  stays alive => the crash is
+//       in the menu/draw side;  still crashes => the crash is in attaching the view.
+#define DIAG_NO_DRAW     1
 #define TICK_SECONDS     2.0
 #define WATCHDOG_SECONDS 20.0
 
@@ -73,6 +84,9 @@ static void STATUS(NSString *fmt, ...)
     [gLines addObject:s2];
     while (gLines.count > 4) [gLines removeObjectAtIndex:0];
 
+#if !SHOW_DEBUG_LABEL
+    return;
+#endif
     if (!gLabel) {
         UIWindow *w = UIApplication.sharedApplication.windows.firstObject;
         if (!w) return;
@@ -188,7 +202,7 @@ static void skyHideMenu(void)
         [(NSObject *)il performSelector:NSSelectorFromString(@"hide")];
         LOG(@"hide()");
     } @catch (NSException *e) {
-        LOG(@"hide EXC %@", e.reason); 
+        LOG(@"hide EXC %@", e.reason);
     }
 }
 
@@ -219,11 +233,18 @@ static void tick(void)
             gAttached = overlayAttached();
             if (gAttached) {
                 STATUS(@"ATTACHED t%d", gTicks);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ [gLabel removeFromSuperview]; });
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(LABEL_LIFETIME * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [gLabel removeFromSuperview];
+                    gLabel = nil;
+                });
                 // from now on we never poke menu_open again: the gesture must be able
                 // to close the menu, and the SDK owns that byte.
                 *(volatile uint8_t *)(base() + OFF_AUTH_FLAG) = 1;
+#if DIAG_NO_DRAW
+                *(volatile uint8_t *)(base() + OFF_MENU_OPEN) = 0;
+                STATUS(@"DIAG: menu pinned CLOSED");
+#endif
             }
         }
 
@@ -250,6 +271,6 @@ static void tick(void)
 __attribute__((constructor))
 static void skyInit(void)
 {
-    STATUS(@"SKYBypass v3 loaded");
+    STATUS(@"SKYBypass v4 diag no-draw=%d", DIAG_NO_DRAW);
     dispatch_async(dispatch_get_main_queue(), ^{ later(2.0); });
 }
