@@ -8,7 +8,8 @@ jobs:
       - name: build dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 -Wno-deprecated-declarations -framework Foundation -framework UIKit -install_name @executable_path/Frameworks/SKYBypass.dylib -o SKYBypass.dylib SKYBypass.m
+          echo "sdk=$SDK"
+          clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -w -ferror-limit=0 -framework Foundation -framework UIKit -install_name @executable_path/Frameworks/SKYBypass.dylib -o SKYBypass.dylib SKYBypass.m
           brew install ldid
           ldid -S SKYBypass.dylib
           ls -l SKYBypass.dylib
