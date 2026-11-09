@@ -1,20 +1,18 @@
- 1| name: build-skybypass
-    2| on: push
-    3| jobs:
-    4|   build:
-    5|     runs-on: macos-latest
-    6|     steps:
-    7|       - uses: actions/checkout@v4
-    8|       - name: build dylib
-    9|         run: |
-   10|           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-   11|           clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2
- -Wno-deprecated-declarations -framework Foundation -framework UIKit -install_name
- @executable_path/Frameworks/SKYBypass.dylib -o SKYBypass.dylib SKYBypass.m
-   12|           brew install ldid
-   13|           ldid -S SKYBypass.dylib
-   14|           ls -l SKYBypass.dylib
-   15|       - uses: actions/upload-artifact@v4
-   16|         with:
-   17|           name: SKYBypass-dylib
-   18|           path: SKYBypass.dylib
+name: build-skybypass
+on: push
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" -dynamiclib -fobjc-arc -O2 -Wno-deprecated-declarations -framework Foundation -framework UIKit -install_name @executable_path/Frameworks/SKYBypass.dylib -o SKYBypass.dylib SKYBypass.m
+          brew install ldid
+          ldid -S SKYBypass.dylib
+          ls -l SKYBypass.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKYBypass-dylib
+          path: SKYBypass.dylib
